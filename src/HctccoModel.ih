@@ -1,0 +1,1303 @@
+/**
+ *  OpenCCO implementation 
+ *  Copyright (C) 2023 B. Kerautret;  Phuc Ngo, N. Passat H. Talbot and C. Jaquet
+ *  Modifications Copyright (C) 2024-2026 S. L. Vajire, J. S. Choy, G. S. Kassab and
+ *  L.-C. Lee (Michigan State University; California Medical Innovations Institute),
+ *  as part of HCT-CCO, a coronary-specific extension of OpenCCO. This file has been
+ *  modified from the original; see README for the list of changes. Modifications are
+ *  released under the same GNU General Public License v3.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ **/
+
+
+#include "CoronaryGeometry.h"
+#include "CoronaryGrowth.h"
+
+#include "DGtal/io/boards/Board2D.h"
+#include "DGtal/io/readers/PPMReader.h"
+#include "DGtal/io/readers/PGMReader.h"
+#include "DGtal/io/readers/GenericReader.h"
+#include "DGtal/io/colormaps/GradientColorMap.h"
+
+#include "DGtal/images/ArrayImageIterator.h"
+#include "DGtal/base/Common.h"
+#include "DGtal/helpers/StdDefs.h"
+#include "DGtal/geometry/helpers/ContourHelper.h"
+
+#include <math.h>
+
+
+template< class DomCtr, int TDim>
+inline
+typename HctccoModel<DomCtr, TDim>::Segment
+HctccoModel<DomCtr, TDim>::updateResistanceFromRoot(unsigned int segIndex) {
+  if(segIndex != 0) {
+    //Update HydroResistance
+    double l = getLengthSegment(segIndex);
+    // Guard against zero/negative lengths to avoid zero resistance
+    const double kEps = 1e-12;
+    if (!(l > 0.0) || !std::isfinite(l)) {
+      l = kEps;
+    }
+    myVectSegments[segIndex].myResistance = 8.0*my_mu*l/M_PI;
+    if(myVectChildren[segIndex].first==0 && myVectChildren[segIndex].second==0)
+      return myVectSegments[segIndex];
+
+    std::pair<int, int> children = myVectChildren[segIndex];
+    int segIndexLeft = children.first;
+    int segIndexRight = children.second;
+
+    // Unary chain handling: imported centerline trees often contain nodes
+    // with a single child (no real bifurcation, just a vertex where the
+    // polyline was sampled). Treat this as a resistance in series: add
+    // the child's resistance to this segment's and propagate radius
+    // unchanged (beta == 1). Without this, the phantom "missing brother"
+    // slot (index 0) is fed into the bifurcation formula and produces
+    // nonsensical betas, which then cascade into radius inversions.
+    if (segIndexLeft != 0 && segIndexRight == 0) {
+      Segment sOnly = updateResistanceFromRoot(segIndexLeft);
+      myVectSegments[sOnly.myIndex].myBeta = 1.0;
+      myVectSegments[segIndex].myResistance += sOnly.myResistance;
+      return myVectSegments[segIndex];
+    }
+    if (segIndexRight != 0 && segIndexLeft == 0) {
+      Segment sOnly = updateResistanceFromRoot(segIndexRight);
+      myVectSegments[sOnly.myIndex].myBeta = 1.0;
+      myVectSegments[segIndex].myResistance += sOnly.myResistance;
+      return myVectSegments[segIndex];
+    }
+
+    //Update resistance of the two children segments
+    Segment sLeft = updateResistanceFromRoot(segIndexLeft);
+    Segment sRight = updateResistanceFromRoot(segIndexRight);
+    return applyResistanceUpdate(segIndex, sLeft, sRight);
+  }
+  return myVectSegments[segIndex];
+}
+
+template< class DomCtr, int TDim>
+inline
+typename HctccoModel<DomCtr, TDim>::Segment
+HctccoModel<DomCtr, TDim>::applyResistanceUpdate(unsigned int segIndex,
+                                                        const Segment &sLeft,
+                                                        const Segment &sRight) {
+  const double kEps = 1e-12;
+  //Update beta of the two children segments
+  double segFlow = sLeft.myFlow;
+  double brotherFlow = sRight.myFlow;
+  double segHydro = sLeft.myResistance;
+  double brotherHydro = sRight.myResistance;
+
+  // Clamp flows/resistances to avoid 0/0 and non-finite values
+  if (!(std::isfinite(segFlow)) || segFlow < kEps) segFlow = kEps;
+  if (!(std::isfinite(brotherFlow)) || brotherFlow < kEps) brotherFlow = kEps;
+  if (!(std::isfinite(segHydro)) || segHydro < kEps) segHydro = kEps;
+  if (!(std::isfinite(brotherHydro)) || brotherHydro < kEps) brotherHydro = kEps;
+
+  //ratio of radii of two brother segments
+  double ratioArgDen = brotherFlow*brotherHydro;
+  double ratioArgNum = segFlow*segHydro;
+  if (!(std::isfinite(ratioArgNum)) || ratioArgNum <= 0.0) ratioArgNum = kEps;
+  if (!(std::isfinite(ratioArgDen)) || ratioArgDen <= 0.0) ratioArgDen = kEps;
+  double ratioR = pow(ratioArgNum / ratioArgDen, 0.25);
+  if (!std::isfinite(ratioR)) {
+    ratioR = 1.0; // fall back to symmetry
+  }
+  //ratio of radii of current segment wrt the parent segment
+  myVectSegments[sLeft.myIndex].myBeta = pow(1.0/(1+pow(ratioR,-my_gamma)),1.0/my_gamma);
+  myVectSegments[sRight.myIndex].myBeta = pow(1.0/(1+pow(1.0/ratioR,-my_gamma)),1.0/my_gamma);
+  // Sanitize betas
+  if (!std::isfinite(myVectSegments[sLeft.myIndex].myBeta)) myVectSegments[sLeft.myIndex].myBeta = 0.5;
+  if (!std::isfinite(myVectSegments[sRight.myIndex].myBeta)) myVectSegments[sRight.myIndex].myBeta = 0.5;
+
+  //Compute resistance of parent segment
+  double r1 = myVectSegments[sLeft.myIndex].myBeta;
+  double r2 = myVectSegments[sRight.myIndex].myBeta;
+  double denom = ( (r1*r1*r1*r1) / segHydro ) + ( (r2*r2*r2*r2) / brotherHydro );
+  if (!(std::isfinite(denom)) || denom < kEps) denom = kEps;
+  myVectSegments[segIndex].myResistance += 1.0/denom ;
+  return myVectSegments[segIndex];
+}
+
+template< class DomCtr, int TDim>
+inline
+typename HctccoModel<DomCtr, TDim>::Segment
+HctccoModel<DomCtr, TDim>::recomputeSegmentResistanceOnly(unsigned int segIndex) {
+  if(segIndex == 0) return myVectSegments[segIndex];
+  const double kEps = 1e-12;
+  double l = getLengthSegment(segIndex);
+  if (!(l > 0.0) || !std::isfinite(l)) {
+    l = kEps;
+  }
+  myVectSegments[segIndex].myResistance = 8.0*my_mu*l/M_PI;
+  if(myVectChildren[segIndex].first==0 && myVectChildren[segIndex].second==0) {
+    return myVectSegments[segIndex];
+  }
+  unsigned int segIndexLeft = myVectChildren[segIndex].first;
+  unsigned int segIndexRight = myVectChildren[segIndex].second;
+  Segment sLeft = myVectSegments[segIndexLeft];
+  Segment sRight = myVectSegments[segIndexRight];
+  return applyResistanceUpdate(segIndex, sLeft, sRight);
+}
+
+template< class DomCtr, int TDim>
+inline
+void
+HctccoModel<DomCtr, TDim>::updateResistanceIncremental(unsigned int segIndex) {
+  if (segIndex == 0) {
+    segIndex = 1;
+  }
+  // Refresh the local subtree
+  updateResistanceFromRoot(segIndex);
+  // Propagate upwards to the root
+  unsigned int parent = myVectParent[segIndex];
+  while (parent != 0) {
+    recomputeSegmentResistanceOnly(parent);
+    parent = myVectParent[parent];
+  }
+}
+
+template< class DomCtr, int TDim >
+void
+HctccoModel<DomCtr, TDim>::updateFlow(unsigned int segIndex, double flowDelta)
+{
+  // Walk from segIndex up to the root, bumping the terminal count and adding
+  // the new terminal's flow contribution. Flow is accumulated additively (not
+  // recomputed as kTerm*q_term) so that non-uniform per-terminal flows are
+  // preserved through the whole path-to-root.
+  Segment sC = myVectSegments[segIndex];
+  while (sC.myIndex != 0){
+    myVectSegments[sC.myIndex].myKTerm ++;
+    myVectSegments[sC.myIndex].myFlow += flowDelta;
+    sC = myVectSegments[myVectParent[sC.myIndex]];
+  }
+}
+
+template< class DomCtr, int TDim >
+double
+HctccoModel<DomCtr, TDim>::terminalFlowWeight(const TPointD &p) const
+{
+  if (my_termFlowCV <= 0.0) return 1.0;
+  // Two independent uniforms in [0,1) hashed deterministically from the point
+  // (FNV-style mixing on millimetre-quantised coordinates with two salts).
+  auto hashU = [&](unsigned long long salt) -> double {
+    unsigned long long h = 1469598103934665603ull ^ salt;
+    for (int i = 0; i < TDim; i++) {
+      long long q = static_cast<long long>(std::llround(p[i] * 1000.0));
+      h ^= static_cast<unsigned long long>(q);
+      h *= 1099511628211ull;
+    }
+    // take 30 high bits -> [0,1)
+    return static_cast<double>((h >> 17) & 0x3FFFFFFFull) / static_cast<double>(0x40000000ull);
+  };
+  double u1 = hashU(0x9E3779B97F4A7C15ull);
+  double u2 = hashU(0xC2B2AE3D27D4EB4Full);
+  if (u1 < 1e-12) u1 = 1e-12;
+  // Box-Muller standard normal.
+  double z = std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * M_PI * u2);
+  // Lognormal with the requested CV, normalised to unit mean.
+  double sigma = std::sqrt(std::log(1.0 + my_termFlowCV * my_termFlowCV));
+  double w = std::exp(sigma * z - 0.5 * sigma * sigma);
+  // Clamp to a sane range to avoid pathological bifurcations.
+  if (w < 0.05) w = 0.05;
+  if (w > 20.0) w = 20.0;
+  return w;
+}
+
+template< class DomCtr, int TDim >
+void
+HctccoModel<DomCtr, TDim>::updateLengthFactor()
+{
+  double r_pk = sqrt(myKTerm + 1)*myRsupp;
+    myLengthFactor =  r_pk / my_rPerf;
+}
+
+
+template< class DomCtr, int TDim>
+void
+HctccoModel<DomCtr, TDim>::updateRadius(unsigned int segIndex, double beta)
+{
+  unsigned int cL = myVectChildren[segIndex].first;
+  unsigned int cR = myVectChildren[segIndex].second;
+
+  if(cL != 0 && cR != 0) {
+    //update radii left and right children (true bifurcation)
+    Segment sLeft = myVectSegments[cL];
+    Segment sRight = myVectSegments[cR];
+    double bL = beta * sLeft.myBeta;
+    double bR = beta * sRight.myBeta;
+    updateRadius(sLeft.myIndex, bL);
+    updateRadius(sRight.myIndex, bR);
+    myVectSegments[cL].myRadius = myVectSegments[1].myRadius * bL;
+    myVectSegments[cR].myRadius = myVectSegments[1].myRadius * bR;
+    return;
+  }
+
+  // Unary chain: propagate radius unchanged (beta == 1) so that the
+  // chain child keeps its parent's radius. Without this the child's
+  // radius would retain whatever was imported / stale and break
+  // parent->child monotonicity.
+  if (cL != 0 && cR == 0) {
+    updateRadius(cL, beta);
+    myVectSegments[cL].myRadius = myVectSegments[1].myRadius * beta;
+    return;
+  }
+  if (cR != 0 && cL == 0) {
+    updateRadius(cR, beta);
+    myVectSegments[cR].myRadius = myVectSegments[1].myRadius * beta;
+    return;
+  }
+  // Terminal: nothing to propagate.
+}
+
+template< class DomCtr, int TDim >
+void
+HctccoModel<DomCtr, TDim>::updateRootRadius()
+{
+    unsigned int idRoot = 1;
+    bool capEnabled = my_rootRadiusMax > 0.0;
+
+    // Poiseuille root radius: r_root = (R_total * Q / dP)^(1/4).  Flow is now
+    // accumulated additively (sum of per-terminal flows), so read it directly
+    // rather than reconstructing it from kTerm*q_term.  We always recompute and
+    // clamp to the cap: flow grows monotonically so r_root rises until it hits
+    // the cap and then stays there.  (A previous early-return that "froze" the
+    // radius once it reached the cap also preserved an imported root radius that
+    // EXCEEDED the cap, e.g. a 1.7 mm root from an older build, instead of
+    // clamping it down.)
+    double Qpk = myVectSegments[idRoot].myFlow;
+    double rRoot = (pow((myVectSegments[idRoot].myResistance * Qpk) / my_pDrop, 0.25));
+    if (capEnabled && rRoot > my_rootRadiusMax) {
+        rRoot = my_rootRadiusMax;
+    }
+    myVectSegments[idRoot].myRadius = rRoot;
+    updateRadius(idRoot, 1.0);
+}
+
+
+template< class DomCtr, int TDim >
+double
+HctccoModel<DomCtr, TDim>::getLengthSegment(unsigned int segIndex)
+{
+  if(segIndex==0) return 0; //there is no parent segment
+  TPointD p1 = myVectSegments[segIndex].myCoordinate;
+  TPointD p2 = myVectSegments[myVectParent[segIndex]].myCoordinate;
+  return (p1-p2).norm()*myLengthFactor;
+}
+
+template< class DomCtr, int TDim >
+double
+HctccoModel<DomCtr, TDim>::computeTotalVolume(unsigned int segIndex)
+{
+  //Volumn of current segment : Eq 20
+  double l = getLengthSegment(segIndex);
+  double r = myVectSegments[segIndex].myRadius;
+  double v = myVectSegments[segIndex].myRadius
+            * myVectSegments[segIndex].myRadius
+            * getLengthSegment(segIndex);
+  double vL, vR;
+  if(myVectChildren[segIndex].first!=0 && myVectChildren[segIndex].second!=0) {
+    vL = computeTotalVolume(myVectChildren[segIndex].first);
+    vR = computeTotalVolume(myVectChildren[segIndex].second);
+    v += vL + vR;
+  }
+  return v;
+}
+
+template< class DomCtr, int TDim >
+bool
+HctccoModel<DomCtr, TDim>::isAddable(const TPointD &p, unsigned int segIndex,
+                              unsigned int nbIter, double tolerance,
+                              unsigned int nbNeibour, bool verbose)
+{
+  // In anywhere mode, only bypass the terminal/parent-only rule.
+  if (!myAnywhereMode) {
+    // Check if target segment is connectable (terminal or parent of terminal)
+    if (!isConnectable(segIndex)) {
+      if (verbose) {
+        std::cout << "Segment " << segIndex << " not connectable (not terminal/parent of terminal)" << std::endl;
+      }
+      return false;
+    }
+  }
+  
+  // Distance constraints are always enforced
+  if (!isDistanceValid(p, 0.05)) {
+    if (verbose) {
+      std::cout << "Point fails distance validation" << std::endl;
+    }
+    return false;
+  }
+  
+  // Connection validity (length/radius/angle) is always enforced
+  if (!isValidConnection(p, segIndex)) {
+    if (verbose) {
+      std::cout << "Point fails connection validation (length/radius/angle)" << std::endl;
+    }
+    return false;
+  }
+
+  typedef typename DomCtr::TPoint::Component TCompPt;
+  TPointD pOpt, newCenter = findBarycenter(p, segIndex);
+  TPoint newCenterDom;
+  for (auto i=0; i < TDim; i++){newCenterDom[i] = static_cast<TCompPt>(newCenter[i]);}
+  TPoint pDom; for (auto i=0; i < TDim; i++){pDom[i] = static_cast<TCompPt>(p[i]);}
+
+  TPoint pSegIndDom; for (auto i=0; i < TDim; i++){pSegIndDom[i] = static_cast<TCompPt>(myVectSegments[segIndex].myCoordinate[i]);}
+  
+  if (!myDomainController().isInside(newCenterDom))
+  {
+      if(verbose) std::cout<<"FAIL: newCenter not inside domain"<<std::endl;
+      return false;
+  }
+
+  if (!myDomainController().checkNoIntersectDomain(pDom, newCenterDom))
+  {
+      if(verbose) std::cout<<"FAIL: p->newCenter intersects domain"<<std::endl;
+      return false;
+  }
+
+  if(!myDomainController().checkNoIntersectDomain(pSegIndDom,
+                                                 newCenterDom))
+  {
+      if(verbose) std::cout<<"FAIL: segIndDistal->newCenter intersects domain"<<std::endl;
+      return false;
+  }
+      
+  // Creation a copy of parent segment
+  Segment sParent = myVectSegments[myVectParent[segIndex]];
+  TPointD pParent = sParent.myCoordinate;
+  TPoint pParentDom;
+  for (auto i=0; i < TDim; i++){
+      pParentDom[i] = static_cast<TCompPt>(pParent[i]);
+  }
+
+  if(!myDomainController().checkNoIntersectDomain(pParentDom,
+                                                newCenterDom))
+  { if(verbose) std::cout<<"FAIL: parent->newCenter intersects domain"<<std::endl; return false; }
+  
+  // Creation of the left child
+  Segment sNewLeft;
+  sNewLeft.myCoordinate = myVectSegments[segIndex].myCoordinate;
+  sNewLeft.myIndex = (unsigned int) myVectSegments.size();
+  sNewLeft.myRadius = myVectSegments[segIndex].myRadius;
+  sNewLeft.myFlow = myVectSegments[segIndex].myFlow;
+  sNewLeft.myKTerm = myVectSegments[segIndex].myKTerm;
+  sNewLeft.myResistance = myVectSegments[segIndex].myResistance;
+  // Per-terminal perfusion flow (unit weight unless my_termFlowCV>0).
+  double qNew = my_qTerm * terminalFlowWeight(p);
+  // Creation of the right child
+  Segment sNewRight;
+  sNewRight.myCoordinate = p;
+  sNewRight.myIndex = (unsigned int) myVectSegments.size()+1;
+  sNewRight.myRadius = myVectSegments[segIndex].myRadius;
+  sNewRight.myFlow = qNew;
+  sNewRight.myKTerm = 1;
+  // Cretation a copy of center segment
+  Segment sCurrent = myVectSegments[segIndex];
+  sCurrent.myCoordinate = newCenter;
+  sCurrent.myFlow = myVectSegments[segIndex].myFlow + qNew;
+  sCurrent.myKTerm = sNewLeft.myKTerm + 1;
+  
+  //center of the current segment
+  TPointD pCurrent = (sParent.myCoordinate+sNewLeft.myCoordinate)/2.0;
+  double r0 = sCurrent.myRadius, r1 = sCurrent.myRadius, r2 = sCurrent.myRadius;
+  bool res1 = true, res2 = false, res3 = true, res4 = false, isDone = false;
+  double vol = -1, volCurr = -1, diffVol = -1;
+  HctccoModel cTreeCurr = *this;
+  if (verbose)
+  {
+    DGtal::trace.info() <<"---------- segIndex: "<<segIndex<<std::endl;
+  }
+  size_t i=0;
+  for(size_t i=0; i<nbIter && !isDone; i++)
+  {
+    res1 = kamyiaOptimization(pCurrent, pParent, sCurrent.myRadius,
+                              sNewLeft, sNewRight, 1, pOpt, r0, r1, r2);
+    if(!res1) //Kamyia does not have solution
+    { if(verbose) std::cout<<"FAIL: Kamyia no solution"<<std::endl; return false; }
+    
+    //Check for middle seg
+    int idSegPar = myVectParent[segIndex];
+    int idL = myVectChildren[idSegPar].first;
+    int idR = myVectChildren[idSegPar].second;
+    res2 = isIntersectingTree(pOpt, pParent, r0, std::make_tuple(idL, idR, idSegPar));
+    if(res2) //there is intersection between segments
+    { return false; }
+    
+    //Check for left seg
+    idL = myVectChildren[segIndex].first;
+    idR = myVectChildren[segIndex].second;
+    res2 = isIntersectingTree(pOpt, sNewLeft.myCoordinate, r1,  std::make_tuple(segIndex, idL, idR));
+    if(res2) //there is intersection between segments
+    { return false; }
+      
+    //Check for right seg
+    res2 = isIntersectingTree(pOpt, p, r2,  std::make_tuple(segIndex,-1,-1));
+    if(res2) //there is intersection between segments
+    { return false; }
+    
+    TPoint pParentDom; for (auto i=0; i < TDim; i++){pParentDom[i] = static_cast<int>(pParent[i]);}
+    TPoint pOptDom; for (auto i=0; i < TDim; i++){pOptDom[i] = static_cast<int>(pOpt[i]);}
+    TPoint sNewLeftDom; for (auto i=0; i < TDim; i++){sNewLeftDom[i] = static_cast<int>(sNewLeft.myCoordinate[i]);}
+    TPoint sNewRightDom; for (auto i=0; i < TDim; i++){sNewRightDom[i] = static_cast<int>(sNewRight.myCoordinate[i]);}
+
+    if(!myDomainController().isInside(pOptDom))
+    { //resulting point is out of the domain
+      if(verbose) std::cout<<"FAIL: pOpt (bifurcation) not inside domain"<<std::endl;
+      return false;
+    }
+   
+    
+    //resulting segments intersect the domaine
+    if( !myDomainController().checkNoIntersectDomain(pParentDom, pOptDom)) //Center segment
+    { if(verbose) std::cout<<"FAIL: center seg (parent->pOpt) intersects domain"<<std::endl; return false; }
+    if(!myDomainController().checkNoIntersectDomain(sNewLeftDom, pOptDom)) //Left segment
+    { if(verbose) std::cout<<"FAIL: left seg intersects domain"<<std::endl; return false; }
+    if(!myDomainController().checkNoIntersectDomain(sNewRightDom, pOptDom)) //Right segment
+    { if(verbose) std::cout<<"FAIL: right seg intersects domain"<<std::endl; return false; }
+    
+    //Otherwise, iterate for the optimisation process
+    HctccoModel cTree1 = *this;
+    //Update optimal values
+    sNewLeft.myRadius = r1;
+    sNewRight.myRadius = r2;
+    
+    //Add left segment
+    cTree1.myVectSegments.push_back(sNewLeft);
+    cTree1.myVectChildren.push_back(std::pair<unsigned int, unsigned int>(0,0));
+    cTree1.myVectParent.push_back(segIndex);
+    
+    // Update for the new parent of the new left segment
+    unsigned int leftGrandChildIndex = cTree1.myVectChildren[myVectSegments[segIndex].myIndex].first;
+    unsigned int rightGrandChildIndex = cTree1.myVectChildren[myVectSegments[segIndex].myIndex].second;
+    cTree1.myVectParent[leftGrandChildIndex] = sNewLeft.myIndex;
+    cTree1.myVectParent[rightGrandChildIndex] = sNewLeft.myIndex;
+    
+    // Update of the child of the new left segment (sNewLeft)
+    cTree1.myVectChildren[sNewLeft.myIndex].first = leftGrandChildIndex;
+    cTree1.myVectChildren[sNewLeft.myIndex].second = rightGrandChildIndex;
+    
+    //Add right segment
+    cTree1.myVectSegments.push_back(sNewRight);
+    cTree1.myVectChildren.push_back(std::pair<unsigned int, unsigned int>(0,0));
+    cTree1.myVectParent.push_back(segIndex);
+    cTree1.myVectTerminals.push_back(sNewRight.myIndex);
+    
+    // Update center segment
+    cTree1.myVectSegments[segIndex].myCoordinate = pOpt;
+    cTree1.myVectSegments[segIndex].myRadius = r0;
+    cTree1.myVectSegments[segIndex].myKTerm = sCurrent.myKTerm;
+    cTree1.myVectSegments[segIndex].myFlow = sCurrent.myFlow;
+    //update childrens of center segment
+    cTree1.myVectChildren[segIndex].first = sNewLeft.myIndex;
+    cTree1.myVectChildren[segIndex].second = sNewRight.myIndex;
+    
+    // update parameters
+    cTree1.myKTerm++;
+    // Update physiological parameters (propagate the new terminal flow up).
+    cTree1.updateFlow(cTree1.myVectParent[segIndex], qNew);
+    cTree1.myLastUpdatedSegment = segIndex;
+    // Use a full root-down resistance recompute to keep every segment's
+    // resistance coherent with the current length factor and topology.
+    // An incremental update here can leave "mixed-era" resistances at
+    // bifurcations if any prior step changed the length factor but only
+    // refreshed part of the tree, which later shows up as radii that
+    // increase from parent to child.
+    cTree1.updateResistanceFromRoot(1);
+    cTree1.updateRootRadius();
+    
+    // Compute vol of the current tree
+    vol = cTree1.computeTotalVolume();
+    if (verbose){
+      DGtal::trace.info() <<"Iter "<<i<<" has tree Volume: "<< vol <<std::endl;
+    }
+    if(i==0) {
+      volCurr = vol;
+      cTreeCurr = cTree1;
+    }
+    else {
+      diffVol = volCurr - vol;
+      if(fabs(diffVol) < tolerance)
+      {
+        // Verify the degenerate case of the resulting segment
+        double l0 = (pOpt - pParent).norm()*myLengthFactor;
+        double l1 = (pOpt - sNewLeft.myCoordinate).norm()*myLengthFactor;
+        double l2 = (pOpt - sNewRight.myCoordinate).norm()*myLengthFactor;
+        res3 = (2*r0<=l0) && (2*r1<=l1) && (2*r2<=l2);
+        // If there is a solution, then save the result
+        if(res3)
+        {
+          //std::cout<<"Best volume at "<<i<<std::endl;
+          isDone = true;
+          *this = cTree1;
+          myLastUpdatedSegment = segIndex;
+        }
+      }
+      else
+      {
+        volCurr = vol;
+        cTreeCurr = cTree1;
+      }
+    }
+    
+    //update new position, radius and flow
+    pCurrent = pOpt;
+    sCurrent.myRadius = cTree1.myVectSegments[segIndex].myRadius;
+    sNewLeft.myRadius = cTree1.myVectSegments[cTree1.myVectChildren[segIndex].first].myRadius;
+    sNewLeft.myFlow = cTree1.myVectSegments[cTree1.myVectChildren[segIndex].first].myFlow;
+    sNewRight.myRadius = cTree1.myVectSegments[cTree1.myVectChildren[segIndex].second].myRadius;
+    sNewRight.myFlow = cTree1.myVectSegments[cTree1.myVectChildren[segIndex].second].myFlow;
+  }
+    
+  
+  return isDone;
+}
+
+
+
+
+template<typename DomCtr, int TDim >
+bool
+HctccoModel<DomCtr, TDim>::isIntersectingTree(const TPointD &ptA, const TPointD &ptB, double r, unsigned int idSeg) const
+{
+  //Get coordinates of points
+  Segment sParent = myVectSegments[myVectParent[idSeg]];
+  Segment sNewLeft = myVectSegments[idSeg];
+  Segment sNewRight;
+  sNewRight.myCoordinate = ptA;
+
+  //Check for middle seg
+  int idSegPar = myVectParent[idSeg];
+  int idL = myVectChildren[idSegPar].first;
+  int idR = myVectChildren[idSegPar].second;
+  bool res2 = isIntersectingTree(ptB, sParent.myCoordinate, r, std::make_tuple(idL, idR, idSegPar));
+  if(res2) //there is intersection betweeen segments
+    return true;
+  
+  //Check for left seg
+  idL = myVectChildren[idSeg].first;
+  idR = myVectChildren[idSeg].second;
+  res2 = isIntersectingTree(ptB, sNewLeft.myCoordinate, r, std::make_tuple(idSeg, idL, idR));
+  if(res2) //there is intersection betweeen segments
+    return true;
+    
+  //Check for right seg
+  res2 = isIntersectingTree(ptB, ptA, r, std::make_tuple(idSeg,-1,-1));
+  if(res2) //there is intersection betweeen segments
+    return true;
+    
+  return false;
+}
+
+
+
+template<class DomCtr, int TDim >
+bool
+HctccoModel<DomCtr, TDim>::isIntersectingTree(const TPointD &ptA, const TPointD &ptB, double r, std::tuple<int, int, int> idExcept) const
+//int idExcept1, int idExcept2,  int idExcept3) const
+{
+  int idExcept1 = std::get<0>(idExcept);
+  int idExcept2 = std::get<1>(idExcept);
+  int idExcept3 = std::get<2>(idExcept);
+  if(idExcept1==0 || idExcept2==0 || idExcept3==0) //root segment
+    return false;
+  for(auto s : myVectSegments) {
+    //s.myIndex = 0 is the root segment
+    if(s.myIndex !=0 && s.myIndex != idExcept1 && s.myIndex != idExcept2 && s.myIndex != idExcept3) {
+      TPointD ptC = s.myCoordinate;
+      TPointD ptD = myVectSegments[myVectParent[s.myIndex]].myCoordinate;
+      if(CoronaryGeometry::isIntersecting<TDim>(ptA, ptB, r, ptC, ptD, s.myRadius)) {
+        //std::cout<<"Seg bug :"<<s.myIndex<<" ==> seg expt :"<<idExcept1<<", "<<idExcept2<<", "<<idExcept3<<std::endl;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+
+template< class DomCtr, int TDim >
+void
+HctccoModel<DomCtr, TDim>::boardDisplay(double thickness, bool clearDisplay)
+{
+  double scaleFactorEPS = 0.01;
+  myBoard.setUnit(scaleFactorEPS, LibBoard::Board::UCentimeter);
+  if (clearDisplay){
+    myBoard.clear();
+  }
+  // 57.5 from myBoard change scale
+  double scaleBoard = 57.5*scaleFactorEPS;
+  // drawing base circle
+  if (std::is_same<DomCtr, CircularDomainCtrl<TDim>>::value)
+  {
+    myBoard.setPenColor(DGtal::Color::Blue);
+    myBoard.setLineWidth(myVectSegments[0].myRadius*scaleBoard*thickness);
+    myBoard.drawCircle(myTreeCenter[0], myTreeCenter[1], my_rPerf, 1);
+  }
+  
+  // draw root: (first segment is special reduced to one point and no parent).
+  TPointD p0 = myVectSegments[0].myCoordinate;
+  myBoard.setPenColor(DGtal::Color(10, 100, 0, 180));
+  myBoard.setLineWidth(1.0);
+  myBoard.fillCircle(p0[0], p0[1], 2.0*myVectSegments[1].myRadius*scaleBoard*thickness, 1);
+  
+  myBoard.setPenColor(DGtal::Color(100, 100, 0, 180));
+  myBoard.setLineWidth(1.0);
+  myBoard.fillCircle(myTreeCenter[0], myTreeCenter[1], 2.0*myVectSegments[1].myRadius*scaleBoard*thickness, 1);
+  
+  
+  TPointD p1 = myVectSegments[1].myCoordinate;
+  
+  myBoard.setPenColor(DGtal::Color(180, 0, 0, 180));
+  myBoard.setLineWidth(1.0);
+  myBoard.fillCircle(p1[0], p1[1], myVectSegments[1].myRadius*thickness, 1);
+  
+  myBoard.setLineWidth(myVectSegments[1].myRadius*scaleBoard*thickness);
+  myBoard.setPenColor(DGtal::Color(150, 0, 0, 150));
+  myBoard.drawLine(p0[0], p0[1], p1[0], p1[1], 2);
+  
+  DGtal::GradientColorMap<int> cmap_grad( 0, (int) myVectSegments.size()+1 );
+  cmap_grad.addColor( DGtal::Color( 50, 50, 255 ) );
+  cmap_grad.addColor( DGtal::Color( 255, 0, 0 ) );
+  cmap_grad.addColor( DGtal::Color( 255, 255, 10 ) );
+  unsigned int i = 0;
+  for (auto s : myVectSegments)
+  {
+    // test if the segment is the root or its parent we do not display (already done).
+    if (s.myIndex == 0 || s.myIndex == 1)
+      continue;
+  
+    // distal node
+    TPointD distal = s.myCoordinate;
+    TPointD proxital = myVectSegments[myVectParent[s.myIndex]].myCoordinate;
+    myBoard.setLineWidth(myVectSegments[s.myIndex].myRadius*scaleBoard*thickness);
+    // myBoard.setPenColor(cmap_grad(i));
+    myBoard.setPenColor(DGtal::Color::Gray);
+    myBoard.drawLine(distal[0], distal[1], proxital[0], proxital[1],2);
+    myBoard.setLineWidth(1.0);
+    myBoard.setPenColor(DGtal::Color(180, 0, 0, 180));
+    myBoard.fillCircle(distal[0], distal[1], myVectSegments[s.myIndex].myRadius*thickness, 1 );
+    i++;
+  }
+  if (std::is_same<DomCtr, ImageMaskDomainCtrl<TDim>>::value)
+  {
+     auto vectContours = myDomainController().contours();//CoronaryGrowth::getImageContours(myDomainController().myImage, myForegroundThreshold);
+     for(auto const c: vectContours){
+       DGtal::Color col;
+       if(DGtal::ContourHelper::isCounterClockWise(c)){
+         col = DGtal::Color(200, 200, 200);
+       }else{
+         col = DGtal::Color::White;
+       }
+       std::vector<LibBoard::Point> bv;
+       for(unsigned int i=0; i<c.size(); i++){
+         bv.push_back(LibBoard::Point(c[i][0], c[i][1]));
+       }
+       myBoard.setFillColor(col);
+       myBoard.setLineWidth(5.0*scaleFactorEPS);
+       myBoard.fillPolyline(bv);
+       myBoard.drawPolyline(bv);
+     }
+
+   }
+ }
+
+template< class DomCtr, int TDim >
+void
+HctccoModel<DomCtr, TDim>::exportBoardDisplay(const std::string &fileName,
+                                       double thickness,
+                                       bool updateDisplay,
+                                       bool clearDisplay){
+  if (updateDisplay){
+    boardDisplay(thickness, clearDisplay);
+  }
+  if (std::is_same<DomCtr, ImageMaskDomainCtrl<TDim>>::value)
+  {
+    myBoard.drawDot(0, 0);
+    myBoard.drawDot(myDomainController().upperBound()[0],
+                    myDomainController().upperBound()[1]);
+
+  }
+  std::string ext = fileName.substr(fileName.find_last_of(".") + 1);
+  if (ext == "svg")
+  {
+    myBoard.saveSVG(fileName.c_str());
+  }
+  else if (ext == "eps") {
+    myBoard.saveEPS(fileName.c_str());
+  }
+}
+
+template< class DomCtr, int TDim >
+unsigned int
+HctccoModel<DomCtr, TDim>::getNearestSegment(const TPointD &pt)
+{
+  unsigned int sNear=1;
+  double distMin = getProjDistance(myVectSegments[0].myCoordinate,
+                                   myVectSegments[1].myCoordinate, pt);
+  for (const auto &s: myVectSegments)
+  {
+    if (s.myIndex==0)
+      continue;
+    
+    double d = getProjDistance(s.myCoordinate,
+                              myVectSegments[myVectParent[s.myIndex]].myCoordinate, pt);
+
+    if (d < distMin)
+    {
+      distMin = d;
+      sNear = s.myIndex;
+    }
+  }
+  return sNear;
+}
+
+
+template< class DomCtr, int TDim >
+std::vector<unsigned int>
+HctccoModel<DomCtr, TDim>::getPathToRoot(const Segment &s)
+{
+  std::vector<unsigned int> res;
+  Segment sC = s;
+  while (sC.myIndex != 0){
+    res.push_back(sC.myIndex);
+    sC = myVectSegments[ myVectParent[sC.myIndex]];
+  }
+  return res;
+}
+
+template< class DomCtr, int TDim >
+typename HctccoModel<DomCtr, TDim>::TPointD
+HctccoModel<DomCtr, TDim>::generateNewLocation(unsigned int nbTrials){
+  TPointD  res;
+  double myDThresold = getDistanceThreshold();
+  bool found = false;
+  unsigned int n = nbTrials;
+  while(!found && n >= 0) {
+    n--;
+    auto p =  generateALocation(myDThresold);
+    found = p.second;
+    if (found) {
+      res = p.first;
+    }
+    if (n==0) {
+      n = nbTrials;
+      myDThresold *= 0.9;
+    }
+  }
+  return res;
+}
+
+template< typename DomCtr, int TDim >
+std::pair<typename HctccoModel<DomCtr, TDim>::TPointD, bool>
+HctccoModel<DomCtr, TDim>::generateALocation(double myDThresold) {
+    TPointD res;
+    res = myDomainController().randomPoint();
+    bool isComp = true;
+    bool isComp2 = true;
+    unsigned int id = 1;
+    
+    while ( isComp && id < myVectTerminals.size() ) {
+      isComp = (myVectSegments[myVectTerminals[id]].myCoordinate - res).norm() > myDThresold;
+     //isComp = getProjDistance(myVectTerminals[id], res) > myDThresold;
+      id++;
+    }
+    
+    //generated point must have a certain distance to ALL tree segments
+    while ( isComp2 && id < myVectSegments.size() ) {
+      isComp2 = getProjDistance(myVectSegments[id].myIndex, res) > myVectSegments[id].myRadius;
+      id++;
+    }
+    return  std::pair<TPointD, bool> {res, isComp && isComp2};
+}
+
+
+template< typename DomCtr, int TDim >
+bool
+HctccoModel<DomCtr, TDim>::isToCloseFromNearest(const TPointD &p, double minDist) const{
+  double d = getProjDistance(getN_NearestSegments(p,1)[0],p);
+  return d < minDist;
+}
+
+template<typename DomCtr, int TDim >
+double
+HctccoModel<DomCtr, TDim>::getProjDistance(const TPointD &p0, const TPointD &p1, const TPointD &p) const{
+  double result = 0.0;
+  TPointD pProj(0,0);
+  bool isInside = CoronaryGeometry::projectOnStraightLine(p0, p1, p, pProj);
+  if (isInside)
+  {
+    result = (pProj-p).norm();
+  }
+  else
+  {
+    result = std::min((p0-p).norm(), (p1-p).norm());
+  }
+
+  return result;
+}
+
+template<typename DomCtr, int TDim >
+double
+HctccoModel<DomCtr, TDim>::getProjDistance(unsigned int index, const TPointD &p ) const {
+  TPointD p0 = myVectSegments[index].myCoordinate;
+  TPointD p1 = myVectSegments[myVectParent[index]].myCoordinate;
+  return  getProjDistance(p0, p1, p);
+}
+
+template< typename DomCtr, int TDim >
+std::vector<unsigned int>
+HctccoModel<DomCtr, TDim>::getN_NearestSegments(const TPointD &p, unsigned int n) const {
+  // Progressive coronary restrictions based on percentage completion
+  double restrictionLevel = getConnectionRestrictionLevel();
+  
+  std::vector<unsigned int> connectableSegments;
+  std::vector<unsigned int> allSegments;
+  
+  // Get all segments (excluding root)
+  for (unsigned int i = 1; i < myVectSegments.size(); i++) {
+    allSegments.push_back(i);
+  }
+  
+  // Sort all segments by distance first
+  std::sort(allSegments.begin(), allSegments.end(), 
+    [this, &p](unsigned int a, unsigned int b) {
+      return getProjDistance(a, p) < getProjDistance(b, p);
+    });
+  
+  // Anywhere mode: allow any segment by proximity
+  if (myAnywhereMode) {
+    std::vector<unsigned int> result;
+    for (unsigned int i = 0; i < allSegments.size() && result.size() < n; i++) {
+      result.push_back(allSegments[i]);
+    }
+    return result;
+  }
+  
+  if (restrictionLevel >= 1.0) {
+    // Late stage (35-100%): Full coronary restrictions - only leaf nodes + immediate parent
+    for (unsigned int seg : allSegments) {
+      if (isConnectable(seg)) {
+        connectableSegments.push_back(seg);
+      }
+    }
+    
+    // Return only connectable segments, up to n
+    std::vector<unsigned int> result;
+    for (unsigned int i = 0; i < connectableSegments.size() && result.size() < n; i++) {
+      result.push_back(connectableSegments[i]);
+    }
+    return result;
+    
+  } else if (restrictionLevel == 0.5) {
+    // Middle stage (10-35%): Leaf nodes + 3-6 generations above them
+    std::vector<unsigned int> middleStageSegments = getConnectableSegmentsForMiddleStage();
+    std::vector<unsigned int> result;
+    
+    // Filter allSegments to only include middle stage connectable segments
+    for (unsigned int seg : allSegments) {
+      if (std::find(middleStageSegments.begin(), middleStageSegments.end(), seg) != middleStageSegments.end()) {
+        result.push_back(seg);
+        if (result.size() >= n) break;
+      }
+    }
+    
+    return result;
+  }
+  
+  // Early stage (0-10%): No restrictions (any segment)
+  std::vector<unsigned int> result;
+  for (unsigned int i = 0; i < allSegments.size() && result.size() < n; i++) {
+    result.push_back(allSegments[i]);
+  }
+  return result;
+}
+
+template< typename DomCtr, int TDim >
+bool
+HctccoModel<DomCtr, TDim>::kamyiaOptimization(const TPointD& pCurrent,
+                                       const TPointD& pParent,
+                                       double rCurrent,
+                                       const Segment& sL,
+                                       const Segment& sR,
+                                       unsigned int nbIter,
+                                               TPointD& pOpt,
+                                       double& r0, double& r1, double& r2){
+  
+  // Prepare
+  TPointD pL = sL.myCoordinate;
+  TPointD pR = sR.myCoordinate;
+  
+  //std::cout<<"myFlow="<< myVectSegments[index].myFlow<<" and sL.myFlow="<<sL.myFlow<<" and sR.myFlow="<<sR.myFlow<<std::endl;
+  //double ratioQ = sL.myFlow/sCurrent.myFlow;//0.5;
+  //std::cout<<"ratioQ="<< ratioQ<<std::endl;
+  //double rr0 = sCurrent.myRadius;
+  double R0 = rCurrent*rCurrent;//rr0*rr0; //R0 = r0*r0
+  double R1 = sL.myRadius*sL.myRadius;//rr0*rr0; //R1 = r1*r1
+  double R2 = sR.myRadius*sR.myRadius;//rr0*rr0; //R2 = r2*r2
+  
+  double f1 = sL.myFlow;//ratioQ*f0;//k * r1*r1*r1; //left
+  double f2 = sR.myFlow;//(1.0-ratioQ)*f0;//k * r2*r2*r2; //right
+  double f0 =  f1 + f2;//R0*R0*R0; //middle
+  // Starting position from Equation (21) for initialisation as mentionned page 11 [Clara Jaquet et HT]
+  //TPoint pb ((f0*pParent[0]+f1*pL[0]+f2*pR[0])/(2.0*f0), (f0*pParent[1]+f1*pL[1]+f2*pR[1])/(2.0*f0));
+  //TPoint pb ((pParent[0]+pL[0])/(2.0), (pParent[1]+pL[1])/(2.0)); //center of the old segment
+  
+  // Analytical seed using flow ratios (hybrid initialization)
+  double ratioSeed = 1.0;
+  if (f2 > 0 && f1 > 0) {
+    ratioSeed = std::pow(f1 / f2, 0.25);
+  }
+  double betaLeftSeed = std::pow(1.0/(1.0+std::pow(1.0/ratioSeed, -my_gamma)), 1.0/my_gamma);
+  double betaRightSeed = std::pow(1.0/(1.0+std::pow(ratioSeed, -my_gamma)), 1.0/my_gamma);
+  double rLeftSeed = std::max(1e-8, rCurrent * betaLeftSeed);
+  double rRightSeed = std::max(1e-8, rCurrent * betaRightSeed);
+  R1 = rLeftSeed * rLeftSeed;
+  R2 = rRightSeed * rRightSeed;
+
+  TPointD pb;//TPointD pb (pCurrent[0], pCurrent[1]);
+  double denomSeed = std::max(1e-8, 2.0 * f0);
+  for (auto i=0; i < TDim; i++){
+    double weighted = (f0*pParent[i] + f1*pL[i] + f2*pR[i]) / denomSeed;
+    if (std::isfinite(weighted)) {
+      pb[i] = weighted;
+    } else {
+      pb[i] = pCurrent[i];
+    }
+  }
+  
+  //std::cout<<"Init:"<<pb<<std::endl;
+  double l0 = (pParent - pb).norm()*myLengthFactor;
+  double l1 = (pL - pb).norm()*myLengthFactor;
+  double l2 = (pR - pb).norm()*myLengthFactor;
+  //std::cout<<"l0="<<l0<<", l1="<<l1<<", l2="<<l2<<std::endl;
+  double kappa = 8 * my_mu / M_PI;
+  double deltaP1k = kappa*((f0*l0)/(R0*R0)+(f1*l1)/(R1*R1));
+  double deltaP2k = kappa*((f0*l0)/(R0*R0)+(f2*l2)/(R2*R2));
+  double deltaP1 = (f0*l0)/(R0*R0)+(f1*l1)/(R1*R1);
+  double deltaP2 = (f0*l0)/(R0*R0)+(f2*l2)/(R2*R2);
+  
+  double rr1 = R1;
+  double rr2 = R2;
+  
+  // The variable to solve for with its initial value. It will be
+  // mutated in place by the solver.
+  
+  bool hasSolution = true;
+  
+  for (int i = 0; i<nbIter && hasSolution; i++) {
+    //DGtal::trace.progressBar(i, nbIter);
+    hasSolution = CoronaryGeometry::kamyiaOpt(my_gamma, deltaP1, deltaP2, f0, f1, f2, l0, l1, l2,rr1, rr2);
+    // Equation 27
+    R0 = pow(f0*(pow(rr1, my_gamma)/f1 + pow(rr2, my_gamma)/f2), 1.0/my_gamma);
+    R1 = rr1;
+    R2 = rr2;
+    // Equation (26) page 13
+    //pb[0] = (pParent[0]*R0/l0 + pL[0]*R1/l1 + pR[0]*R2/l2)/(R0/l0+R1/l1+R2/l2);
+    //pb[1] = (pParent[1]*R0/l0 + pL[1]*R1/l1 + pR[1]*R2/l2)/(R0/l0+R1/l1+R2/l2);
+    for (auto i=0; i < TDim; i++){
+      pb[i] = (pParent[i]*R0/l0 + pL[i]*R1/l1 + pR[i]*R2/l2)/(R0/l0+R1/l1+R2/l2);
+    }
+    
+    //Update values
+    deltaP1 = (f0*l0)/(R0*R0)+(f1*l1)/(R1*R1);
+    deltaP2 = (f0*l0)/(R0*R0)+(f2*l2)/(R2*R2);
+    l0 = (pParent - pb).norm()*myLengthFactor;
+    l1 = (pL - pb).norm()*myLengthFactor;
+    l2 = (pR - pb).norm()*myLengthFactor;
+    //std::cout << "r0 : " << sqrt(R0) << ", r1 : " << sqrt(R1) << ", sqrt(R2) : " << sqrt(R2) << "\n";
+    //std::cout << "R0 : " << R0 << ", R1 : " << R1 << ", R2 : " << R2 << "\n";
+    //std::cout << "pbNew[0]  : " << pb[0] << " and pbNew[1] " << pb[1] << "\n";
+  }
+  
+  // If there is a solution, then update result
+  if(hasSolution) {
+    pOpt = pb;
+    r0 = sqrt(R0);
+    r1 = sqrt(R1);
+    r2 = sqrt(R2);
+  }
+  return hasSolution;
+}
+
+template< typename DomCtr, int TDim >
+void
+HctccoModel<DomCtr, TDim>::selfDisplay( std::ostream & out ) const {
+  out << std::endl << "----" << std::endl;
+  out << "HctccoModel: " << std::endl;
+  out << "main parameters: myKTerm: "  << myKTerm << "\n\t myRsupp: " <<myRsupp << std::endl;
+  out << "\n\t Nb Segments from container: " << myVectSegments.size() << std::endl;
+  out << "----" << std::endl;
+}
+template< typename DomCtr, int TDim >
+typename HctccoModel<DomCtr, TDim>::TPoint HctccoModel<DomCtr,TDim>::getDomainCenter() const {
+  if (!myDomainController().myIsImageDomainRestrained){
+    return TPoint::diagonal(0);
+  }
+  else {
+    // searching the farthest point of the border domain
+    double maxDistance = 0;
+    TPoint ptMax = TPoint::diagonal(0);
+    for (auto p: myDomainController().myImage.domain()){
+      if (myDomainController().myDistanceImage(p) >= maxDistance){
+        ptMax = p;
+        maxDistance = myImageDist(p);
+      }
+    }
+    return ptMax;
+  }
+}
+
+template<typename DomCtr, int TDim >
+
+std::ostream&
+operator<< ( std::ostream & out,
+            const HctccoModel<DomCtr, TDim> & aCoronaryTree )
+{
+  aCoronaryTree.selfDisplay ( out );
+  return out;
+}
+
+
+
+template< typename DomCtr, int TDim >
+double
+HctccoModel<DomCtr, TDim>::getDistanceThreshold(){
+    // Check with python code, here is the equation after simplification
+    if (TDim==3)
+    {
+        return pow(((4.0*M_PI*my_rPerf*my_rPerf*my_rPerf)/(3.0*myKTerm)),1.0/3.0);
+    }
+    else if(TDim==2) {
+        return sqrt((M_PI*my_rPerf*my_rPerf)/myKTerm);
+    }
+    //Scale factor must be taken into account here
+    //return sqrt((M_PI*(myKTerm + 1)*myRsupp*myRsupp)/myKTerm) / myLengthFactor;
+}
+
+template< typename DomCtr, int TDim >
+typename HctccoModel<DomCtr, TDim>::TPointD
+HctccoModel<DomCtr, TDim>::findBarycenter(const TPointD &p, unsigned int index)
+{
+  TPointD first_point=p;
+  TPointD second_point=myVectSegments[index].myCoordinate;
+  TPointD third_point=myVectSegments[myVectParent[index]].myCoordinate;
+  TPointD barycenter;
+  for(auto i=0; i<TDim; i++){
+    barycenter[i]=(first_point[i]+second_point[i]+third_point[i])/3.0;
+  }
+  return barycenter;
+}
+
+
+
+template< typename DomCtr, int TDim >
+bool operator==(typename HctccoModel<DomCtr, TDim>::Segment S1,
+                typename HctccoModel<DomCtr, TDim>::Segment S2)
+{
+  if(S1.myCoordinate==S2.myCoordinate)
+  {
+    return true;
+  }
+  else
+  {
+    return false;
+  }
+}
+template< typename DomCtr, int TDim >
+bool operator!=(typename HctccoModel<DomCtr, TDim>::Segment  S1,
+                typename HctccoModel<DomCtr, TDim>::Segment S2)
+{
+  if(S1.myCoordinate!=S2.myCoordinate)
+  {
+    return true;
+  }
+  else
+  {
+    return false;
+  }
+}
+
+template< class DomCtr, int TDim >
+bool
+HctccoModel<DomCtr, TDim>::isConnectable(unsigned int segIndex) const
+{
+  // Check if segment is a terminal (leaf node)
+  if (std::find(myVectTerminals.begin(), myVectTerminals.end(), segIndex) != myVectTerminals.end()) {
+    return true;
+  }
+  
+  // Check if segment is an immediate parent of a terminal
+  unsigned int child1 = myVectChildren[segIndex].first;
+  unsigned int child2 = myVectChildren[segIndex].second;
+  
+  bool hasTerminalChild = false;
+  if (child1 != 0) {
+    hasTerminalChild |= (std::find(myVectTerminals.begin(), myVectTerminals.end(), child1) != myVectTerminals.end());
+  }
+  if (child2 != 0) {
+    hasTerminalChild |= (std::find(myVectTerminals.begin(), myVectTerminals.end(), child2) != myVectTerminals.end());
+  }
+  
+  return hasTerminalChild;
+}
+
+template< class DomCtr, int TDim >
+std::vector<unsigned int>
+HctccoModel<DomCtr, TDim>::getConnectableSegmentsForMiddleStage() const
+{
+  std::vector<unsigned int> connectableSegments;
+  std::set<unsigned int> uniqueSegments; // Use set to avoid duplicates
+  
+  // For each terminal (leaf) node
+  for (unsigned int terminalIndex : myVectTerminals) {
+    // Add the terminal itself
+    uniqueSegments.insert(terminalIndex);
+    
+    // Trace up the parent chain
+    std::vector<unsigned int> parentsUpTo3;
+    std::vector<unsigned int> parentsUpTo6;
+    
+    unsigned int currentSeg = terminalIndex;
+    
+    if (myExtensionMode) {
+      // Extension mode: Only use 1-3 generations (more restrictive)
+      for (int generation = 1; generation <= 3 && currentSeg != 0; generation++) {
+        unsigned int parentIndex = myVectParent[currentSeg];
+        if (parentIndex != 0 && parentIndex != currentSeg) { // Avoid root and self-reference
+          uniqueSegments.insert(parentIndex);
+          currentSeg = parentIndex;
+        } else {
+          break;
+        }
+      }
+    } else {
+      // Normal mode: Use 3-6 generations with fallback logic
+      // Collect up to 3 generations of parents
+      for (int generation = 1; generation <= 3 && currentSeg != 0; generation++) {
+        unsigned int parentIndex = myVectParent[currentSeg];
+        if (parentIndex != 0 && parentIndex != currentSeg) { // Avoid root and self-reference
+          parentsUpTo3.push_back(parentIndex);
+          currentSeg = parentIndex;
+        } else {
+          break;
+        }
+      }
+      
+      // Continue collecting up to 6 generations total
+      for (int generation = 4; generation <= 6 && currentSeg != 0; generation++) {
+        unsigned int parentIndex = myVectParent[currentSeg];
+        if (parentIndex != 0 && parentIndex != currentSeg) { // Avoid root and self-reference
+          parentsUpTo6.push_back(parentIndex);
+          currentSeg = parentIndex;
+        } else {
+          break;
+        }
+      }
+      
+      // Add parents from 1-3 generations
+      for (unsigned int seg : parentsUpTo3) {
+        uniqueSegments.insert(seg);
+      }
+      
+      // If we don't have enough connections in first 3 generations, add 4-6 generations
+      if (parentsUpTo3.size() < 3) { // If less than 3 generations available
+        for (unsigned int seg : parentsUpTo6) {
+          uniqueSegments.insert(seg);
+        }
+      }
+    }
+  }
+  
+  // Convert set to vector
+  for (unsigned int seg : uniqueSegments) {
+    connectableSegments.push_back(seg);
+  }
+  
+  return connectableSegments;
+}
+
+
+
+template< class DomCtr, int TDim >
+bool
+HctccoModel<DomCtr, TDim>::isValidConnection(const TPointD &p, unsigned int segIndex) const
+{
+  // Get progressive constraints based on tree growth
+  double maxLength = getMaxBranchLength();
+  double minRadius = getMinBranchRadius();
+  
+  TPointD segmentPoint = myVectSegments[segIndex].myCoordinate;
+  
+  // 1. Check segment length constraint (prevents unrealistic long vessels)
+  double newSegmentLength = (p - segmentPoint).norm();
+  
+  if (newSegmentLength > maxLength) {
+    return false; // New branch would be too long (>25 units)
+  }
+  
+  // 2. Check radius constraints (new branches should be smaller than parent)
+  double parentRadius = myVectSegments[segIndex].myRadius;
+  double expectedNewRadius = parentRadius * 0.7; // Typical scaling for small branches
+  
+  if (expectedNewRadius < minRadius) {
+    return false; // Would create unrealistically small vessels
+  }
+  
+  // Note: No angle constraints (keep original CCO behavior)
+  // Note: Original CCO degenerate case check still applies: length >= 2 * radius
+  return true;
+}
+
+template< class DomCtr, int TDim >
+bool
+HctccoModel<DomCtr, TDim>::isDistanceValid(const TPointD &p, double minPerfusionDistance) const
+{
+  // 1. Enhanced distance check from all existing segments
+  for (const auto &s: myVectSegments) {
+    if (s.myIndex == 0) continue; // Skip root
+    
+    double distance = getProjDistance(s.myIndex, p);
+    double requiredDistance = std::max(minPerfusionDistance, s.myRadius * 2.0);
+    
+    if (distance < requiredDistance) {
+      return false;
+    }
+  }
+  
+  // 2. Check minimum distance from all terminal points (perfusion areas)
+  for (unsigned int termIndex : myVectTerminals) {
+    double distance = (myVectSegments[termIndex].myCoordinate - p).norm();
+    if (distance < minPerfusionDistance) {
+      return false;
+    }
+  }
+  
+  // 3. Domain-specific checks could be added here
+  // (e.g., distance from epicardium, endocardium in cardiac applications)
+  
+  return true;
+}
+
+
+
+
+
+
+
+
+
+

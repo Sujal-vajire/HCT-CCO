@@ -1,0 +1,9 @@
+build/
+**/__pycache__/
+*.o
+*.pyc
+*.vtp
+*.obj
+*.off
+*_tree.xml
+final_tree*
